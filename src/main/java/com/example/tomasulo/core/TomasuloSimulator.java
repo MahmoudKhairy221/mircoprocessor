@@ -7,7 +7,11 @@ import com.example.tomasulo.utils.RegisterType;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 public class TomasuloSimulator {
     private ReservationStationManager rsManager;
@@ -18,6 +22,16 @@ public class TomasuloSimulator {
     private ExecutionState state;
     private List<Instruction> instructions;
     private boolean branchStall;
+    
+    // Track simultaneous completion groups
+    // Key: executeEndCycle, Value: Set of reservation station names that finished at that cycle
+    private Map<Integer, Set<String>> simultaneousCompletionGroups;
+    // Track which reservation station names belong to incomplete simultaneous completion groups
+    private Set<String> incompleteGroupMembers;
+    // Track which RS names wrote back this cycle and are in incomplete groups
+    private Set<String> incompleteGroupMembersWrittenBackThisCycle;
+    // Track which dependent RS names should wait because their dependency is in an incomplete group
+    private Set<String> dependentRSWaitingForIncompleteGroup;
     
     public TomasuloSimulator() {
         this(Constants.DEFAULT_CACHE_SIZE, Constants.DEFAULT_BLOCK_SIZE);
@@ -33,6 +47,8 @@ public class TomasuloSimulator {
         state = new ExecutionState();
         instructions = new ArrayList<>();
         branchStall = false;
+        simultaneousCompletionGroups = new HashMap<>();
+        incompleteGroupMembers = new HashSet<>();
     }
     
     public void loadInstructions(List<Instruction> insts) {
@@ -55,6 +71,10 @@ public class TomasuloSimulator {
         state.setSimulationComplete(false);
         state.setStatusMessage("Ready");
         branchStall = false;
+        simultaneousCompletionGroups.clear();
+        incompleteGroupMembers.clear();
+        incompleteGroupMembersWrittenBackThisCycle = new HashSet<>();
+        dependentRSWaitingForIncompleteGroup = new HashSet<>();
         
         // Reset program instructions (just in case)
         for (Instruction inst : instructions) {
@@ -73,6 +93,12 @@ public class TomasuloSimulator {
         
         state.incrementCycle();
         state.setStatusMessage("Cycle " + state.getCurrentCycle());
+        
+        // Clear the set of incomplete group members that wrote back this cycle
+        // NOTE: Do NOT clear dependentRSWaitingForIncompleteGroup here; we keep
+        // it until the corresponding group finishes write-back to ensure
+        // dependents stay stalled across cycles.
+        incompleteGroupMembersWrittenBackThisCycle.clear();
         
         // 1. Execute stage (try to start execution for ready instructions)
         execute();
@@ -414,6 +440,21 @@ public class TomasuloSimulator {
                 if ((rs.getQj() == null || rs.getQj().isEmpty()) &&
                     (rs.getQk() == null || rs.getQk().isEmpty())) {
                     
+                    // Check if any dependency belongs to an incomplete simultaneous completion group
+                    if (isDependencyInIncompleteGroup(rs.getQj()) || 
+                        isDependencyInIncompleteGroup(rs.getQk())) {
+                        // Delay execution start - wait for all group members to write back
+                        continue;
+                    }
+                    
+                    // Check if this RS is waiting for an incomplete group member to finish writing back
+                    if (dependentRSWaitingForIncompleteGroup.contains(rs.getName()) &&
+                        !incompleteGroupMembers.isEmpty()) {
+                        // This RS depends on an incomplete group member that wrote back this cycle
+                        // Delay execution until all group members have written back
+                        continue;
+                    }
+                    
                     if (inst.getExecuteStartCycle() == -1) {
                         inst.setExecuteStartCycle(state.getCurrentCycle());
                         int latency = rsManager.getInstructionLatency(inst.getType());
@@ -428,6 +469,21 @@ public class TomasuloSimulator {
                 // For ALU operations, check if operands are ready
                 if ((rs.getQj() == null || rs.getQj().isEmpty()) &&
                     (rs.getQk() == null || rs.getQk().isEmpty())) {
+                    
+                    // Check if any dependency belongs to an incomplete simultaneous completion group
+                    if (isDependencyInIncompleteGroup(rs.getQj()) || 
+                        isDependencyInIncompleteGroup(rs.getQk())) {
+                        // Delay execution start - wait for all group members to write back
+                        continue;
+                    }
+                    
+                    // Check if this RS is waiting for an incomplete group member to finish writing back
+                    if (dependentRSWaitingForIncompleteGroup.contains(rs.getName()) &&
+                        !incompleteGroupMembers.isEmpty()) {
+                        // This RS depends on an incomplete group member that wrote back this cycle
+                        // Delay execution until all group members have written back
+                        continue;
+                    }
                     
                     if (inst.getExecuteStartCycle() == -1) {
                         inst.setExecuteStartCycle(state.getCurrentCycle());
@@ -446,6 +502,10 @@ public class TomasuloSimulator {
     private void executeLoad(ReservationStation rs, Instruction inst) {
         // Check if base register is ready
         if (rs.getQj() != null && !rs.getQj().isEmpty()) {
+            // Also check if the dependency belongs to an incomplete simultaneous completion group
+            if (isDependencyInIncompleteGroup(rs.getQj())) {
+                return; // Wait for all group members to write back
+            }
             return; // Base register not ready - wait
         }
         
@@ -497,6 +557,11 @@ public class TomasuloSimulator {
         // Check if operands are ready (Qj and Qk must be null/empty)
         if ((rs.getQj() != null && !rs.getQj().isEmpty()) ||
             (rs.getQk() != null && !rs.getQk().isEmpty())) {
+            // Also check if any dependency belongs to an incomplete simultaneous completion group
+            if (isDependencyInIncompleteGroup(rs.getQj()) || 
+                isDependencyInIncompleteGroup(rs.getQk())) {
+                return; // Wait for all group members to write back
+            }
             return; // Operands not ready - wait for tags to clear
         }
         
@@ -564,6 +629,33 @@ public class TomasuloSimulator {
             }
         }
         
+        // Detect simultaneous completions: if multiple instructions are ready for write-back,
+        // check if they have the same executeEndCycle
+        if (readyStations.size() > 1) {
+            Map<Integer, List<ReservationStation>> groupsByEndCycle = new HashMap<>();
+            for (ReservationStation rs : readyStations) {
+                Instruction inst = rs.getInstruction();
+                if (inst != null) {
+                    int endCycle = inst.getExecuteEndCycle();
+                    groupsByEndCycle.computeIfAbsent(endCycle, k -> new ArrayList<>()).add(rs);
+                }
+            }
+            
+            // For each group with multiple members, create a simultaneous completion group
+            for (Map.Entry<Integer, List<ReservationStation>> entry : groupsByEndCycle.entrySet()) {
+                if (entry.getValue().size() > 1) {
+                    int endCycle = entry.getKey();
+                    Set<String> groupMembers = simultaneousCompletionGroups.computeIfAbsent(
+                        endCycle, k -> new HashSet<>());
+                    
+                    for (ReservationStation rs : entry.getValue()) {
+                        groupMembers.add(rs.getName());
+                        incompleteGroupMembers.add(rs.getName());
+                    }
+                }
+            }
+        }
+        
         // Sort by issue cycle (FIFO) to handle simultaneous completion
         readyStations.sort(Comparator.comparing((ReservationStation rs) -> {
             Instruction inst = rs.getInstruction();
@@ -617,6 +709,23 @@ public class TomasuloSimulator {
                     registerFile.clearTag(dest);
                 }
                 
+                // Check if this RS is in an incomplete group before updating operands
+                boolean isInIncompleteGroup = incompleteGroupMembers.contains(rs.getName());
+                
+                // If this RS is in an incomplete group, track which dependent RS are affected
+                // BEFORE calling updateOperands() (which will clear Qj/Qk)
+                if (isInIncompleteGroup) {
+                    incompleteGroupMembersWrittenBackThisCycle.add(rs.getName());
+                    // Track which dependent RS had their Qj/Qk cleared by this incomplete group member
+                    for (ReservationStation dependentRS : rsManager.getAllStations()) {
+                        if (dependentRS.isBusy() && 
+                            (rs.getName().equals(dependentRS.getQj()) || 
+                             rs.getName().equals(dependentRS.getQk()))) {
+                            dependentRSWaitingForIncompleteGroup.add(dependentRS.getName());
+                        }
+                    }
+                }
+                
                 // Update reservation stations waiting for this result
                 rsManager.updateOperands(rs.getName(), result);
                 
@@ -637,6 +746,10 @@ public class TomasuloSimulator {
                 // Clear reservation station
                 rs.clear();
                 
+                // Check if this RS was part of a simultaneous completion group
+                // and if so, check if all members have written back
+                checkAndCleanupGroup(rs.getName(), inst.getExecuteEndCycle());
+                
                 // Only write-back one instruction per cycle (bus conflict resolution)
                 break;
             } else if (inst.getType().getCategory() == InstructionType.InstructionCategory.STORE) {
@@ -651,6 +764,18 @@ public class TomasuloSimulator {
                     entry.setCompleted(true);
                     loadStoreBuffer.removeEntry(entry);
                 }
+                
+                // Check if this RS is in an incomplete group
+                boolean isInIncompleteGroup = incompleteGroupMembers.contains(rs.getName());
+                if (isInIncompleteGroup) {
+                    incompleteGroupMembersWrittenBackThisCycle.add(rs.getName());
+                    // Track which dependent RS had their Qj/Qk cleared by this incomplete group member
+                    // BEFORE the RS is cleared (stores don't have destination, so no updateOperands call)
+                    // But we still need to track for cleanup purposes
+                }
+                
+                // Check if this RS was part of a simultaneous completion group
+                checkAndCleanupGroup(rs.getName(), inst.getExecuteEndCycle());
                 
                 break;
             } else if (inst.getType().getCategory() == InstructionType.InstructionCategory.BRANCH) {
@@ -817,7 +942,63 @@ public class TomasuloSimulator {
                 // Clear reservation station
                 rs.clear();
                 
+                // Check if this RS was part of a simultaneous completion group
+                checkAndCleanupGroup(rs.getName(), inst.getExecuteEndCycle());
+                
                 break;
+            }
+        }
+    }
+    
+    /**
+     * Check if a dependency (reservation station name) belongs to an incomplete
+     * simultaneous completion group. If so, execution should be delayed.
+     */
+    private boolean isDependencyInIncompleteGroup(String dependencyRS) {
+        if (dependencyRS == null || dependencyRS.isEmpty()) {
+            return false;
+        }
+        return incompleteGroupMembers.contains(dependencyRS);
+    }
+    
+    /**
+     * Check if a reservation station was part of a simultaneous completion group,
+     * and if all members have written back, mark the group as complete.
+     */
+    private void checkAndCleanupGroup(String rsName, int executeEndCycle) {
+        Set<String> group = simultaneousCompletionGroups.get(executeEndCycle);
+        if (group != null && group.contains(rsName)) {
+            // Check if all members of this group have written back
+            boolean allWrittenBack = true;
+            for (String memberRS : group) {
+                // Find the reservation station by name
+                ReservationStation memberStation = null;
+                for (ReservationStation rs : rsManager.getAllStations()) {
+                    if (rs.getName().equals(memberRS)) {
+                        memberStation = rs;
+                        break;
+                    }
+                }
+                
+                if (memberStation != null && memberStation.isBusy()) {
+                    // Station is still busy - check if instruction has written back
+                    Instruction memberInst = memberStation.getInstruction();
+                    if (memberInst != null && memberInst.getWriteBackCycle() == -1) {
+                        // Instruction hasn't written back yet
+                        allWrittenBack = false;
+                        break;
+                    }
+                }
+                // If station is not busy or not found, it has been cleared (written back)
+            }
+            
+            if (allWrittenBack) {
+                // All members have written back - mark group as complete
+                for (String memberRS : group) {
+                    incompleteGroupMembers.remove(memberRS);
+                }
+                // Clear dependent RS waiting flags since the group is now complete
+                dependentRSWaitingForIncompleteGroup.clear();
             }
         }
     }
